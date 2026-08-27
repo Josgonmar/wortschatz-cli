@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a random German-English entry from a local DING dictionary."""
+"""Print a random German translation entry from a local dictionary."""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ import os
 import random
 import struct
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Optional, Sequence, Tuple
@@ -21,6 +23,7 @@ from typing import BinaryIO, Optional, Sequence, Tuple
 DEFAULT_DICTIONARY_URL = (
     "https://ftp.tu-chemnitz.de/pub/Local/urz/ding/de-en/de-en.txt.zip"
 )
+DEFAULT_LANGUAGE = "es"
 DICTIONARY_FILENAME = "de-en.txt"
 INDEX_FILENAME = "de-en.idx"
 METADATA_FILENAME = "metadata.json"
@@ -29,6 +32,68 @@ INDEX_HEADER = struct.Struct("<8sQQ")
 INDEX_OFFSET = struct.Struct("<Q")
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 MAX_DICTIONARY_BYTES = 128 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class DictionarySpec:
+    """Source and storage details for one German-to-target dictionary."""
+
+    language: str
+    name: str
+    url: str
+    source_filename: str
+    archive: bool
+    archive_format: str
+    reverse_sides: bool
+    license: str
+
+    @property
+    def dictionary_filename(self) -> str:
+        return f"de-{self.language}.txt"
+
+    @property
+    def index_filename(self) -> str:
+        return f"de-{self.language}.idx"
+
+    @property
+    def metadata_filename(self) -> str:
+        # Keep the original metadata filename for existing DE-EN
+        # installations, while giving other dictionaries their own metadata.
+        if self.language == "en":
+            return METADATA_FILENAME
+        return f"metadata-de-{self.language}.json"
+
+
+DICTIONARIES = {
+    "en": DictionarySpec(
+        language="en",
+        name="English",
+        url=DEFAULT_DICTIONARY_URL,
+        source_filename="de-en.txt",
+        archive=True,
+        archive_format="zip",
+        reverse_sides=False,
+        license="GPL-2.0-or-later",
+    ),
+    "es": DictionarySpec(
+        language="es",
+        name="Spanish",
+        url=(
+            "https://sourceforge.net/projects/macding/files/"
+            "german-spanish%20dictionary/ger-esp%20%28version%2013.05.05%29/"
+            "ger-esp.tar.gz/download"
+        ),
+        source_filename="ger-esp.ding",
+        archive=True,
+        archive_format="tar.gz",
+        reverse_sides=True,
+        license=(
+            "GPL-2.0-or-later, GFDL-1.2-or-later, "
+            "CC BY-SA 1.0"
+        ),
+    ),
+}
+SUPPORTED_LANGUAGES = tuple(DICTIONARIES)
 
 
 class WortschatzError(Exception):
@@ -45,6 +110,16 @@ def default_data_dir() -> Path:
         return Path(xdg_data_home).expanduser() / "wortschatz"
 
     return Path.home() / ".local" / "share" / "wortschatz"
+
+
+def dictionary_spec(language: str = DEFAULT_LANGUAGE) -> DictionarySpec:
+    try:
+        return DICTIONARIES[language]
+    except KeyError as error:
+        choices = ", ".join(SUPPORTED_LANGUAGES)
+        raise WortschatzError(
+            f"unsupported target language {language!r}; choose one of: {choices}"
+        ) from error
 
 
 def _is_dictionary_entry(line: bytes) -> bool:
@@ -93,7 +168,7 @@ def _copy_limited(source: BinaryIO, destination: BinaryIO, limit: int) -> int:
         destination.write(chunk)
 
 
-def _download_archive(url: str, destination: Path) -> int:
+def _download_source(url: str, destination: Path) -> int:
     request = urllib.request.Request(
         url,
         headers={
@@ -108,24 +183,70 @@ def _download_archive(url: str, destination: Path) -> int:
         with urllib.request.urlopen(request, timeout=60) as response:
             advertised_size = response.headers.get("Content-Length")
             if advertised_size and int(advertised_size) > MAX_DOWNLOAD_BYTES:
-                raise WortschatzError("the dictionary archive is unexpectedly large")
-            with destination.open("wb") as archive:
-                return _copy_limited(response, archive, MAX_DOWNLOAD_BYTES)
+                raise WortschatzError("the dictionary source is unexpectedly large")
+            with destination.open("wb") as source:
+                return _copy_limited(response, source, MAX_DOWNLOAD_BYTES)
     except (urllib.error.URLError, TimeoutError) as error:
         raise WortschatzError(f"could not download the dictionary: {error}") from error
 
 
-def _extract_dictionary(archive_path: Path, destination: Path) -> None:
+def _download_archive(url: str, destination: Path) -> int:
+    """Backward-compatible name for the dictionary source downloader."""
+    return _download_source(url, destination)
+
+
+def _extract_dictionary(
+    archive_path: Path,
+    destination: Path,
+    expected_filename: str = DICTIONARY_FILENAME,
+    archive_format: str = "zip",
+) -> None:
+    if archive_format == "tar.gz":
+        try:
+            with tarfile.open(archive_path, "r:*") as archive:
+                matches = [
+                    member
+                    for member in archive.getmembers()
+                    if member.isfile() and Path(member.name).name == expected_filename
+                ]
+                if len(matches) != 1:
+                    raise WortschatzError(
+                        f"archive should contain exactly one {expected_filename} file"
+                    )
+
+                member = matches[0]
+                if member.size > MAX_DICTIONARY_BYTES:
+                    raise WortschatzError(
+                        "the uncompressed dictionary is unexpectedly large"
+                    )
+
+                source = archive.extractfile(member)
+                if source is None:
+                    raise WortschatzError(
+                        f"could not read {expected_filename} from the dictionary archive"
+                    )
+                with source, destination.open("wb") as output:
+                    _copy_limited(source, output, MAX_DICTIONARY_BYTES)
+            return
+        except tarfile.ReadError as error:
+            raise WortschatzError(
+                "the downloaded dictionary is not a valid TAR archive"
+            ) from error
+
+    if archive_format != "zip":
+        raise WortschatzError(f"unsupported dictionary archive format: {archive_format}")
+
     try:
         with zipfile.ZipFile(archive_path) as archive:
             matches = [
                 member
                 for member in archive.infolist()
-                if not member.is_dir() and Path(member.filename).name == DICTIONARY_FILENAME
+                if not member.is_dir()
+                and Path(member.filename).name == expected_filename
             ]
             if len(matches) != 1:
                 raise WortschatzError(
-                    f"archive should contain exactly one {DICTIONARY_FILENAME} file"
+                    f"archive should contain exactly one {expected_filename} file"
                 )
 
             member = matches[0]
@@ -138,30 +259,80 @@ def _extract_dictionary(archive_path: Path, destination: Path) -> None:
         raise WortschatzError("the downloaded dictionary is not a valid ZIP archive") from error
 
 
-def update_dictionary(data_dir: Path, url: str) -> Tuple[int, int]:
+def _reverse_dictionary(source_path: Path, destination: Path) -> None:
+    """Normalize a target-first DING list to the CLI's German-first format."""
+    with source_path.open("rb") as source, destination.open("wb") as output:
+        for line in source:
+            content = line.rstrip(b"\r\n")
+            line_ending = line[len(content) :]
+            if _is_dictionary_entry(line):
+                left, right = content.split(b"::", 1)
+                content = right.strip() + b" :: " + left.strip()
+            output.write(content + line_ending)
+
+
+def _prepare_dictionary(
+    source_path: Path,
+    raw_dictionary_path: Path,
+    dictionary_path: Path,
+    spec: DictionarySpec,
+) -> None:
+    if spec.archive:
+        _extract_dictionary(
+            source_path,
+            raw_dictionary_path,
+            expected_filename=spec.source_filename,
+            archive_format=spec.archive_format,
+        )
+    else:
+        with source_path.open("rb") as source, raw_dictionary_path.open("wb") as output:
+            _copy_limited(source, output, MAX_DICTIONARY_BYTES)
+
+    if spec.reverse_sides:
+        _reverse_dictionary(raw_dictionary_path, dictionary_path)
+    else:
+        os.replace(raw_dictionary_path, dictionary_path)
+
+
+def update_dictionary(
+    data_dir: Path,
+    url: Optional[str] = None,
+    language: str = DEFAULT_LANGUAGE,
+) -> Tuple[int, int]:
     """Download, validate, index, and atomically install the dictionary."""
+    spec = dictionary_spec(language)
+    source_url = url if url is not None else spec.url
     data_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="update-", dir=data_dir) as temporary:
         temporary_dir = Path(temporary)
-        archive_path = temporary_dir / "dictionary.zip"
-        dictionary_path = temporary_dir / DICTIONARY_FILENAME
-        index_path = temporary_dir / INDEX_FILENAME
+        source_path = temporary_dir / "dictionary-source"
+        raw_dictionary_path = temporary_dir / "dictionary-raw.txt"
+        dictionary_path = temporary_dir / spec.dictionary_filename
+        index_path = temporary_dir / spec.index_filename
 
-        download_size = _download_archive(url, archive_path)
-        _extract_dictionary(archive_path, dictionary_path)
+        download_size = _download_archive(source_url, source_path)
+        _prepare_dictionary(
+            source_path,
+            raw_dictionary_path,
+            dictionary_path,
+            spec,
+        )
         entry_count = build_index(dictionary_path, index_path)
 
-        os.replace(dictionary_path, data_dir / DICTIONARY_FILENAME)
-        os.replace(index_path, data_dir / INDEX_FILENAME)
+        os.replace(dictionary_path, data_dir / spec.dictionary_filename)
+        os.replace(index_path, data_dir / spec.index_filename)
 
     metadata = {
-        "source": url,
-        "license": "GPL-2.0-or-later",
+        "source": source_url,
+        "language": f"de-{spec.language}",
+        "source_language": "de",
+        "target_language": spec.language,
+        "license": spec.license,
         "downloaded_at": datetime.now(timezone.utc).isoformat(),
         "entries": entry_count,
     }
-    metadata_path = data_dir / METADATA_FILENAME
+    metadata_path = data_dir / spec.metadata_filename
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=data_dir, delete=False
     ) as temporary_metadata:
@@ -173,40 +344,56 @@ def update_dictionary(data_dir: Path, url: str) -> Tuple[int, int]:
     return entry_count, download_size
 
 
-def _read_index_header(index: BinaryIO, dictionary_size: int) -> int:
+def _read_index_header(
+    index: BinaryIO,
+    dictionary_size: int,
+    language: str = DEFAULT_LANGUAGE,
+) -> int:
+    update_command = f"`wortschatz update --language {language}`"
     header = index.read(INDEX_HEADER.size)
     if len(header) != INDEX_HEADER.size:
-        raise WortschatzError("dictionary index is truncated; run `wortschatz update`")
+        raise WortschatzError(f"dictionary index is truncated; run {update_command}")
 
     magic, indexed_size, entry_count = INDEX_HEADER.unpack(header)
     if magic != INDEX_MAGIC or indexed_size != dictionary_size or entry_count == 0:
-        raise WortschatzError("dictionary index is stale; run `wortschatz update`")
+        raise WortschatzError(f"dictionary index is stale; run {update_command}")
 
     expected_size = INDEX_HEADER.size + entry_count * INDEX_OFFSET.size
     index.seek(0, os.SEEK_END)
     if index.tell() != expected_size:
-        raise WortschatzError("dictionary index is invalid; run `wortschatz update`")
+        raise WortschatzError(f"dictionary index is invalid; run {update_command}")
 
     return entry_count
 
 
-def random_entry(data_dir: Path, generator: Optional[random.Random] = None) -> Tuple[str, str]:
-    dictionary_path = data_dir / DICTIONARY_FILENAME
-    index_path = data_dir / INDEX_FILENAME
+def random_entry(
+    data_dir: Path,
+    generator: Optional[random.Random] = None,
+    language: str = DEFAULT_LANGUAGE,
+) -> Tuple[str, str]:
+    spec = dictionary_spec(language)
+    dictionary_path = data_dir / spec.dictionary_filename
+    index_path = data_dir / spec.index_filename
     if not dictionary_path.is_file() or not index_path.is_file():
-        raise WortschatzError("dictionary is not installed; run `wortschatz update`")
+        raise WortschatzError(
+            f"{spec.name} dictionary is not installed; run "
+            f"`wortschatz update --language {spec.language}`"
+        )
 
     chooser = generator if generator is not None else random.SystemRandom()
     dictionary_size = dictionary_path.stat().st_size
 
     with index_path.open("rb") as index:
-        entry_count = _read_index_header(index, dictionary_size)
+        entry_count = _read_index_header(index, dictionary_size, spec.language)
         selection = chooser.randrange(entry_count)
         index.seek(INDEX_HEADER.size + selection * INDEX_OFFSET.size)
         packed_offset = index.read(INDEX_OFFSET.size)
 
     if len(packed_offset) != INDEX_OFFSET.size:
-        raise WortschatzError("dictionary index is truncated; run `wortschatz update`")
+        raise WortschatzError(
+            "dictionary index is truncated; "
+            f"run `wortschatz update --language {spec.language}`"
+        )
 
     (offset,) = INDEX_OFFSET.unpack(packed_offset)
     with dictionary_path.open("rb") as dictionary:
@@ -214,23 +401,23 @@ def random_entry(data_dir: Path, generator: Optional[random.Random] = None) -> T
         line = dictionary.readline().decode("utf-8", errors="replace").strip()
 
     try:
-        german, english = line.split("::", 1)
+        german, translation = line.split("::", 1)
     except ValueError as error:
         raise WortschatzError("selected dictionary entry is malformed") from error
 
-    return german.strip(), english.strip()
+    return german.strip(), translation.strip()
 
 
-def format_entry(german: str, english: str, use_color: bool) -> str:
+def format_entry(german: str, translation: str, use_color: bool) -> str:
     if use_color:
-        return f"\033[1;33m{german}\033[0m — {english}"
-    return f"{german} — {english}"
+        return f"\033[1;33m{german}\033[0m — {translation}"
+    return f"{german} — {translation}"
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wortschatz",
-        description="Print a random German-English dictionary entry.",
+        description="Print a random German translation entry.",
     )
     parser.add_argument(
         "--data-dir",
@@ -243,12 +430,30 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable ANSI color even when stdout is a terminal",
     )
+    parser.add_argument(
+        "--language",
+        "--to",
+        dest="language",
+        choices=SUPPORTED_LANGUAGES,
+        default=DEFAULT_LANGUAGE,
+        metavar="CODE",
+        help=f"translation target language (default: {DEFAULT_LANGUAGE})",
+    )
     subcommands = parser.add_subparsers(dest="command")
     update = subcommands.add_parser("update", help="download and index the dictionary")
     update.add_argument(
+        "--language",
+        "--to",
+        dest="language",
+        choices=SUPPORTED_LANGUAGES,
+        default=argparse.SUPPRESS,
+        metavar="CODE",
+        help=f"translation target language (default: {DEFAULT_LANGUAGE})",
+    )
+    update.add_argument(
         "--url",
-        default=DEFAULT_DICTIONARY_URL,
-        help="ZIP archive containing de-en.txt",
+        default=None,
+        help="override the source archive or text-file URL",
     )
     return parser
 
@@ -259,14 +464,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if arguments.command == "update":
-            entry_count, download_size = update_dictionary(data_dir, arguments.url)
+            entry_count, download_size = update_dictionary(
+                data_dir,
+                arguments.url,
+                arguments.language,
+            )
             size_mib = download_size / (1024 * 1024)
             print(f"Installed {entry_count:,} entries ({size_mib:.1f} MiB download).")
             return 0
 
-        german, english = random_entry(data_dir)
+        german, translation = random_entry(data_dir, language=arguments.language)
         use_color = sys.stdout.isatty() and not arguments.plain and "NO_COLOR" not in os.environ
-        print(format_entry(german, english, use_color))
+        print(format_entry(german, translation, use_color))
         return 0
     except (OSError, WortschatzError) as error:
         print(f"wortschatz: {error}", file=sys.stderr)

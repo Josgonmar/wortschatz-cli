@@ -103,7 +103,9 @@ case "$shell_mode" in
 esac
 
 if [ "$remove_data" -eq 1 ]; then
-    for filename in de-en.txt de-en.idx metadata.json; do
+    for filename in \
+        de-en.txt de-en.idx de-es.txt de-es.idx \
+        metadata.json metadata-de-es.json; do
         if [ -f "$data_dir/$filename" ]; then
             rm -f "$data_dir/$filename"
             echo "Removed $data_dir/$filename"

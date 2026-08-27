@@ -2,9 +2,7 @@
 
 Build your Wortschatz, one terminal at a time.
 
-`wortschatz` prints a random German-English dictionary entry whenever you open
-an interactive Bash or Zsh terminal. It is a dependency-free Python 3 program;
-the network is only needed when installing or updating its local dictionary.
+`wortschatz` prints a random German dictionary entry with a translation whenever you open an interactive Bash or Zsh terminal. Spanish is the default target; English is also available. It is a dependency-free Python 3 program, and internet is only needed when installing or updating its local dictionary.
 
 ```text
 die Lösung {f} — solution; answer; resolution
@@ -24,10 +22,16 @@ Or configure Bash and Zsh explicitly:
 ./install.sh --shell both
 ```
 
+Install with German-to-English entries instead:
+
+```sh
+./install.sh --language en
+```
+
 The installer:
 
 1. copies the program to `~/.local/bin/wortschatz`;
-2. downloads the dictionary to `~/.local/share/wortschatz`;
+2. downloads the selected dictionary to `~/.local/share/wortschatz`;
 3. builds a compact offset index for fast terminal startup; and
 4. adds an idempotent managed block to `~/.bashrc`, `~/.zshrc`, or both.
 
@@ -36,14 +40,12 @@ The generated hook is valid in both shells:
 ```sh
 # >>> wortschatz-cli >>>
 if [ -t 1 ] && [ -x "$HOME/.local/bin/wortschatz" ]; then
-    "$HOME/.local/bin/wortschatz"
+    "$HOME/.local/bin/wortschatz" --language es
 fi
 # <<< wortschatz-cli <<<
 ```
 
-The `-t` check prevents output in non-interactive sessions. Python can be
-executed from a shell startup file like any other executable; the script's
-`#!/usr/bin/env python3` shebang selects the interpreter.
+The `-t` check prevents output in non-interactive sessions. Python can be executed from a shell startup file like any other executable; the script's `#!/usr/bin/env python3` shebang selects the interpreter.
 
 ## Usage
 
@@ -53,11 +55,20 @@ Print another entry:
 wortschatz
 ```
 
-Refresh the local dictionary and index:
+Refresh the default German-to-Spanish dictionary and index:
 
 ```sh
 wortschatz update
 ```
+
+Download and print German-to-English entries:
+
+```sh
+wortschatz update --language en
+wortschatz --language en
+```
+
+The English and Spanish dictionaries can be installed side by side. The `--language` option accepts `en` and `es` (and can also be written as `--to`).
 
 Disable color:
 
@@ -80,9 +91,7 @@ startup blocks from both Bash and Zsh:
 ./uninstall.sh
 ```
 
-The uninstaller removes only the three known data files and the lines between
-the `wortschatz-cli` markers. It does not delete either shell configuration
-file or unrelated files in the data directory.
+The uninstaller removes only the known dictionary, index, and metadata files and the lines between the `wortschatz-cli` markers. It does not delete either shell configuration file or unrelated files in the data directory.
 
 Keep the downloaded dictionary for a future reinstall:
 
@@ -94,15 +103,10 @@ Remove a hook from only one shell with `--shell bash` or `--shell zsh`.
 
 ## Dictionary source and license
 
-The installer downloads the German-English DING/BEOLINGUS dictionary from
-[Technische Universität Chemnitz](https://www-user.tu-chemnitz.de/~fri/ding/).
-It contains hundreds of thousands of entries and is maintained as a freely
-downloadable translation list.
+The English option downloads the German-English DING/BEOLINGUS dictionary from [Technische Universität Chemnitz](https://www-user.tu-chemnitz.de/~fri/ding/).
+The Spanish option downloads a [SourceForge mirror of the Spanish-German DING list](https://sourceforge.net/projects/macding/files/german-spanish%20dictionary/) associated with the [Savannah ding-es-de project](https://savannah.nongnu.org/projects/ding-es-de/) and normalizes its Spanish-first entries to the German-first format used by this CLI.
 
-The downloaded dictionary is copyright Frank Richter and contributors and is
-licensed under GPL-2.0-or-later. It is not included in this repository; it
-keeps its own license after download. The `wortschatz-cli` source code is
-licensed separately under the repository's MIT license.
+The downloaded dictionaries are not included in this repository and retain their own licenses after download. The English list is licensed under GPL-2.0-or-later. The Spanish list is distributed under GPL-2.0-or-later, GFDL-1.2-or-later, and CC BY-SA 1.0. The `wortschatz-cli` source code is licensed separately under the repository's MIT license.
 
 ## Development
 

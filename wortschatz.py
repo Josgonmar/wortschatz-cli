@@ -17,7 +17,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, Optional, Sequence, Tuple
 
 
 DEFAULT_DICTIONARY_URL = (
@@ -46,6 +46,7 @@ class DictionarySpec:
     archive_format: str
     reverse_sides: bool
     license: str
+    source_encoding: str = "utf-8"
 
     @property
     def dictionary_filename(self) -> str:
@@ -91,6 +92,7 @@ DICTIONARIES = {
             "GPL-2.0-or-later, GFDL-1.2-or-later, "
             "CC BY-SA 1.0"
         ),
+        source_encoding="latin-1",
     ),
 }
 SUPPORTED_LANGUAGES = tuple(DICTIONARIES)
@@ -154,7 +156,12 @@ def build_index(dictionary_path: Path, index_path: Path) -> int:
     return count
 
 
-def _copy_limited(source: BinaryIO, destination: BinaryIO, limit: int) -> int:
+def _copy_limited(
+    source: BinaryIO,
+    destination: BinaryIO,
+    limit: int,
+    progress: Optional[Callable[[int], None]] = None,
+) -> int:
     total = 0
     while True:
         chunk = source.read(1024 * 1024)
@@ -166,6 +173,29 @@ def _copy_limited(source: BinaryIO, destination: BinaryIO, limit: int) -> int:
                 f"download exceeds the safety limit of {limit // (1024 * 1024)} MiB"
             )
         destination.write(chunk)
+        if progress is not None:
+            progress(total)
+
+
+def _format_size(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MiB"
+
+
+def _write_download_progress(downloaded: int, total: Optional[int]) -> None:
+    if total:
+        width = 28
+        fraction = min(downloaded / total, 1.0)
+        filled = int(width * fraction)
+        marker = ">" if filled < width else ""
+        bar = "=" * filled + marker + " " * max(width - filled - len(marker), 0)
+        message = (
+            f"\rDownloading dictionary [{bar}] {fraction:6.1%} "
+            f"{_format_size(downloaded)} / {_format_size(total)}"
+        )
+    else:
+        message = f"\rDownloading dictionary: {_format_size(downloaded)}"
+    sys.stderr.write(message)
+    sys.stderr.flush()
 
 
 def _download_source(url: str, destination: Path) -> int:
@@ -179,15 +209,36 @@ def _download_source(url: str, destination: Path) -> int:
         },
     )
 
+    progress_enabled = False
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             advertised_size = response.headers.get("Content-Length")
-            if advertised_size and int(advertised_size) > MAX_DOWNLOAD_BYTES:
+            try:
+                total_size = int(advertised_size) if advertised_size else None
+            except ValueError:
+                total_size = None
+            if total_size and total_size > MAX_DOWNLOAD_BYTES:
                 raise WortschatzError("the dictionary source is unexpectedly large")
+            progress_enabled = sys.stderr.isatty()
+            progress = None
+            if progress_enabled:
+                _write_download_progress(0, total_size)
+                progress = lambda downloaded: _write_download_progress(
+                    downloaded, total_size
+                )
             with destination.open("wb") as source:
-                return _copy_limited(response, source, MAX_DOWNLOAD_BYTES)
+                return _copy_limited(
+                    response,
+                    source,
+                    MAX_DOWNLOAD_BYTES,
+                    progress=progress,
+                )
     except (urllib.error.URLError, TimeoutError) as error:
         raise WortschatzError(f"could not download the dictionary: {error}") from error
+    finally:
+        if progress_enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def _download_archive(url: str, destination: Path) -> int:
@@ -259,15 +310,22 @@ def _extract_dictionary(
         raise WortschatzError("the downloaded dictionary is not a valid ZIP archive") from error
 
 
-def _reverse_dictionary(source_path: Path, destination: Path) -> None:
+def _reverse_dictionary(
+    source_path: Path,
+    destination: Path,
+    source_encoding: str = "utf-8",
+) -> None:
     """Normalize a target-first DING list to the CLI's German-first format."""
-    with source_path.open("rb") as source, destination.open("wb") as output:
+    with source_path.open(
+        "r", encoding=source_encoding, newline=""
+    ) as source, destination.open("w", encoding="utf-8", newline="") as output:
         for line in source:
-            content = line.rstrip(b"\r\n")
+            content = line.rstrip("\r\n")
             line_ending = line[len(content) :]
-            if _is_dictionary_entry(line):
-                left, right = content.split(b"::", 1)
-                content = right.strip() + b" :: " + left.strip()
+            stripped = content.lstrip()
+            if stripped and not stripped.startswith("#") and "::" in content:
+                left, right = content.split("::", 1)
+                content = right.strip() + " :: " + left.strip()
             output.write(content + line_ending)
 
 
@@ -289,7 +347,11 @@ def _prepare_dictionary(
             _copy_limited(source, output, MAX_DICTIONARY_BYTES)
 
     if spec.reverse_sides:
-        _reverse_dictionary(raw_dictionary_path, dictionary_path)
+        _reverse_dictionary(
+            raw_dictionary_path,
+            dictionary_path,
+            source_encoding=spec.source_encoding,
+        )
     else:
         os.replace(raw_dictionary_path, dictionary_path)
 
@@ -364,6 +426,28 @@ def _read_index_header(
         raise WortschatzError(f"dictionary index is invalid; run {update_command}")
 
     return entry_count
+
+
+def dictionary_entry_count(
+    data_dir: Path,
+    language: str = DEFAULT_LANGUAGE,
+) -> int:
+    """Return the number of entries in an installed dictionary."""
+    spec = dictionary_spec(language)
+    dictionary_path = data_dir / spec.dictionary_filename
+    index_path = data_dir / spec.index_filename
+    if not dictionary_path.is_file() or not index_path.is_file():
+        raise WortschatzError(
+            f"{spec.name} dictionary is not installed; run "
+            f"`wortschatz update --language {spec.language}`"
+        )
+
+    with index_path.open("rb") as index:
+        return _read_index_header(
+            index,
+            dictionary_path.stat().st_size,
+            spec.language,
+        )
 
 
 def random_entry(
@@ -455,6 +539,19 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the source archive or text-file URL",
     )
+    stats = subcommands.add_parser(
+        "stats",
+        help="show installed dictionary statistics",
+    )
+    stats.add_argument(
+        "--language",
+        "--to",
+        dest="language",
+        choices=SUPPORTED_LANGUAGES,
+        default=argparse.SUPPRESS,
+        metavar="CODE",
+        help=f"translation target language (default: {DEFAULT_LANGUAGE})",
+    )
     return parser
 
 
@@ -464,13 +561,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if arguments.command == "update":
+            spec = dictionary_spec(arguments.language)
             entry_count, download_size = update_dictionary(
                 data_dir,
                 arguments.url,
                 arguments.language,
             )
-            size_mib = download_size / (1024 * 1024)
-            print(f"Installed {entry_count:,} entries ({size_mib:.1f} MiB download).")
+            print(
+                f"Installed {spec.name} dictionary: {entry_count:,} entries "
+                f"({_format_size(download_size)} download)."
+            )
+            return 0
+
+        if arguments.command == "stats":
+            spec = dictionary_spec(arguments.language)
+            entry_count = dictionary_entry_count(data_dir, arguments.language)
+            print(f"{spec.name} dictionary: {entry_count:,} entries.")
             return 0
 
         german, translation = random_entry(data_dir, language=arguments.language)

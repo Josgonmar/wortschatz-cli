@@ -86,7 +86,7 @@ class WortschatzTests(unittest.TestCase):
             def fake_download(url, destination):
                 self.assertIn("sourceforge", url)
                 with tarfile.open(destination, "w:gz") as archive:
-                    content = b"casa :: Haus\n"
+                    content = "mío :: mein\n".encode("latin-1")
                     member = tarfile.TarInfo("ger-esp.ding")
                     member.size = len(content)
                     archive.addfile(member, io.BytesIO(content))
@@ -105,8 +105,24 @@ class WortschatzTests(unittest.TestCase):
             self.assertEqual(metadata["language"], "de-es")
             self.assertEqual(
                 wortschatz.random_entry(data_dir, language="es"),
-                ("Haus", "casa"),
+                ("mein", "mío"),
             )
+
+    def test_stats_reports_selected_dictionary_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            dictionary = data_dir / "de-es.txt"
+            index = data_dir / "de-es.idx"
+            dictionary.write_text("mein :: mío\n", encoding="utf-8")
+            wortschatz.build_index(dictionary, index)
+
+            with patch("sys.stdout", new_callable=io.StringIO) as output:
+                result = wortschatz.main(
+                    ["--data-dir", str(data_dir), "stats", "--language", "es"]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(output.getvalue(), "Spanish dictionary: 1 entries.\n")
 
     def test_parser_accepts_language_before_or_after_update(self):
         self.assertEqual(

@@ -70,6 +70,15 @@ wortschatz --language en
 
 The English and Spanish dictionaries can be installed side by side. The `--language` option accepts `en` and `es` (and can also be written as `--to`).
 
+Show the number of entries in an installed dictionary:
+
+```sh
+wortschatz stats
+wortschatz stats --language en
+```
+
+Updates show a terminal download progress bar and report the installed entry count. Spanish source files are converted from their original Latin-1 encoding to UTF-8 when installed, so accented characters display correctly.
+
 Disable color:
 
 ```sh
